@@ -140,12 +140,107 @@ def evaluate_performance(S1, S2, execution_df, initial_capital=100000, stop_loss
 
     metrics = {
         'Final Value': equity_curve.iloc[-1],
-        'Total Return (%)': ((equity_curve.iloc[-1] - initial_capital) / initial_capital),
+        'Total Return (%)': ((equity_curve.iloc[-1] - initial_capital) / initial_capital) * 100,
         'Annualized Sharp Ratio': sharpe_ratio,
         'Max Drawdown (%)': max_drawdown * 100
     }
 
     return performance_df, metrics
+
+def generate_allocated_execution_states(S1_raw, S2_raw, S1_log, S2_log,
+					window=30, entry_thresh=2.0, exit_thresh=0.0,
+					initial_capital=100000, allocation_pct=0.10):
+    # dynamically sizes share orders based on a percentage of the total portfolio at the exact moment of trade entry.
+
+    # 1. Generate Statistical Signals (using Log Prices)
+    S2_with_const = sm.add_constant(S2_log)
+    model = sm.OLS(S1_log, S2_with_const).fit()
+    beta = model.params.iloc[1]
+
+    spread = S1_log - (beta * S2_log)
+    rolling_mean = spread.rolling(window=window).mean()
+    rolling_std = spread.rolling(window=window).std()
+    z_scores = (spread - rolling_mean) / rolling_std
+	# 2. Setup Sizing Arrays
+    n = len(z_scores)
+    s1_shares = np.zeros(n)
+    s2_shares = np.zeros(n)
+
+    current_state = 0 # 0 = Flat, 1 = Long, -1 = Short
+
+    # Track physical share blocks locked at entry
+    allocated_s1_shares = 0.0
+    allocated_s2_shares = 0.0
+
+    # We maintain a mock equity tracker inside the loop to size entries accurately
+    running_equity = initial_capital
+
+    # 3. Iterative Exectution Loop
+    for i in range(window, n):
+        z = z_scores.iloc[i]
+        p1 = S1_raw.iloc[i]
+        p2 = S2_raw.iloc[i]
+
+        # State Transitions
+        if current_state == 0:
+	    # Entry Signal triggered
+            if abs(z) > entry_thresh:
+                current_state = -1 if z > entry_thresh else 1
+
+                # PORTFOLIO ALLOCATION ENGINE
+				# Calculate dollar size for this trade slot
+                trade_allocation = running_equity * allocation_pct
+
+                # Derive target dollar values per leg using Beta-Neutral formula
+                v1_target = trade_allocation / (1 + beta)
+                v2_target = v1_target * beta
+
+                # Convert dollar targets into physical share blocks (rounded down)
+                allocated_s1_shares = np.floor(v1_target / p1)
+                allocated_s2_shares = np.floor(v2_target / p2)
+        elif current_state == -1:
+
+            # Exit Signal for short
+            if z <= exit_thresh:
+                current_state = 0
+                allocated_s1_shares = 0.0
+                allocated_s2_shares = 0.0
+
+        elif current_state == 1:
+
+            # Exit signal for long
+            if z >= -exit_thresh:
+                current_state = 0
+                allocated_s1_shares = 0.0
+                allocated_s2_shares = 0.0
+
+        # 4. Assign current share vectors based on state
+            if current_state == 1:
+                s1_shares[i] = allocated_s1_shares
+                s2_shares[i] = -allocated_s2_shares
+            elif current_state == -1:
+                s1_shares[i] = -allocated_s1_shares
+                s2_shares[i] = allocated_s2_shares
+            else:
+                s1_shares[i] = 0.0
+                s2_shares[i] = 0.0
+
+        # Update our running equity proxy based on yesterday's open positions
+        if i > window:
+            s1_pnl = s1_shares[i-1] * (S1_raw.iloc[i] - S1_raw.iloc[i-1])
+            s2_pnl = s2_shares[i-1] * (S2_raw.iloc[i] - S2_raw.iloc[i-1])
+            running_equity += (s1_pnl + s2_pnl)
+
+    # Output DataFrame for the Risk Module
+    execution_df = pd.DataFrame(index=S1_raw.index)
+    execution_df['Z_Score'] = z_scores
+    execution_df['S1_Shares'] = s1_shares
+    execution_df['S2_Shares'] = s2_shares
+
+    return execution_df, beta
+
+
+
 
 
 # Execution
@@ -170,7 +265,7 @@ if __name__ == "__main__":
     print(f"Targeting Pairs: S1 = {asset_1}, S2 = {asset_2}")
     # run signal generation
     print("Run Signal Generation")
-    execution_output, final_beta = generate_execution_states(log_data[asset_1], log_data[asset_2])
+    execution_output, final_beta = generate_allocated_execution_states(data[asset_1], data[asset_2], log_data[asset_1], log_data[asset_2])
     print(f"Calculated Hedge Ratio (Beta): {final_beta: .4f}")
     # run backtesting
     print("Running Back-Testing")
