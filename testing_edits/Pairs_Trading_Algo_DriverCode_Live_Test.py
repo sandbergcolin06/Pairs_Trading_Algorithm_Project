@@ -1,9 +1,12 @@
+import warnings
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint, kpss
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
+
+warnings.filterwarnings('ignore')
 
 # Step 1:
 
@@ -35,7 +38,7 @@ def calculate_hurst_exponent(time_series, max_lags=20):
 	H > .05: Trending Series
     	"""
 	lags = range(2, max_lags)
-	tau = [np.sqrt(np.std(np.subtract(time_series[lag:], time_series[:-lag))) for lag in lags]
+	tau = [np.sqrt(np.std(np.subtract(time_series[lag:], time_series[:-lag]))) for lag in lags]
 	poly = np.polyfit(np.log(lags), np.log(tau), 1)
 	return poly[0] * 2.0
 
@@ -83,7 +86,7 @@ def pair_filter(S1_log, S2_log, max_half_life=60):
 		trace_stat = jres.lr1[0]
 		crit_value_95 = jres.cvt[0, 1] # 1 corresponds to 95% confidence boundry
 
-		if trace_stat <= crit_value_95
+		if trace_stat <= crit_value_95:
 			return False, {} # Short-Circuit: Failed
 	except Exception:
 		return false, {}
@@ -342,41 +345,92 @@ def generate_allocated_execution_states(S1_raw, S2_raw, S1_log, S2_log,
 
 
 
-
 # Execution
 
 if __name__ == "__main__":
-    print("--- STARTING PIPELINE SMOKE TEST ---")
+    print("--- STARTING PIPELINE of TESTS ---")
 
     # 1. Fetching data
-    tickers = ['XOM', 'CVX', 'COP', 'EOG','PXD']
-    print(f"Downloading historical data for: {tickers}")
-    raw_data = yf.download(tickers, start='2020-01-01', end='2025-01-01', threads=False)['Close']
-    data = raw_data.dropna()
+    tickers = ['XOM', 'CVX', 'COP', 'EOG','OXY', 'GOOG', 'GOOGL']
+
+    print(f"Downloading historical data for: {len(tickers)} tickers...")
+    raw_data = yf.download(tickers, start='2020-01-01', end='2025-01-01', threads=False)['Close'].dropna()
+    
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        raw_data = raw_data['Close']
+    
+    print(f"Initial raw data shape: {raw_data.shape}")
+
+    if raw_data.empty:
+        raise ValueError("No data retrieved from Yahoo Finance.")
+    
+    data = raw_data.ffill().bfill()
+
+    data = data.dropna(axis=1, how='all')
+    data = data.dropna(axis=0, how='any')
+
+    print(f"Cleaned data shape: {data.shape}")
+
+    if data.empty:
+        raise ValueError("Data is empty after cleaning. Check ticker symbols and date range.")
+    
     log_data = np.log(data)
 
+    # 2. Run 5-Stage Filter
 
+    verified_portfolio = {}
+    cols = log_data.columns
 
-    print("Running Module 1: Cointegration Scan...")
-    _,_, identified_pairs = find_cointegrated_pairs(log_data)
-    print(f"Pairs flagged as cointegrated: {identified_pairs}")
-    if len(identified_pairs) > 0:
-	    asset_1, asset_2 = identified_pairs[0]
+    print("Beginning Testing...")
+    for i in range(len(cols)):
+        for j in range(i+1, len(cols)):
+            t1, t2 = cols[i], cols[j]
+
+            passed, metrics = pair_filter(log_data[t1], log_data[t2])
+            if passed:
+                print(f"\n>>> Validated Pair Found: {t1} vs {t2}")
+                print(f" Half-Life: {metrics['Half_Life_Days']:.2f} Days | Hurst: {metrics['Hurst']:.4f}")
+                verified_portfolio[(t1, t2)] = metrics
+
+    # 3. Route to Execution
+
+    if len(verified_portfolio) > 0:
+        # Pick the first validated pair
+        target_pair = list(verified_portfolio.keys())[0]
+        asset_1, asset_2 = target_pair
+        pair_metrics = verified_portfolio[target_pair]
+
+        # Synce the exection rolloing window to the mathematical Half-Life
+        dynamic_window = max(10, int(pair_metrics['Half_Life_Days']))
+        print(f"n\Targeting Validated Pair: S1 = {asset_1}, S2 = {asset_2}")
+        print(f"Syncing state machine rolling window to empirical Half-Life: {dynamic_window} days")
+
     else:
-        print("Warning: No pairs beat the .05 threshold.")
-        asset_1, asset_2 = tickers
-    print(f"Targeting Pairs: S1 = {asset_1}, S2 = {asset_2}")
-    # run signal generation
-    print("Run Signal Generation")
-    execution_output, final_beta = generate_allocated_execution_states(data[asset_1], data[asset_2], log_data[asset_1], log_data[asset_2])
-    print(f"Calculated Hedge Ratio (Beta): {final_beta: .4f}")
-    # run backtesting
-    print("Running Back-Testing")
-    perf_df, final_metrics = evaluate_performance(data[asset_1], data[asset_2], execution_output)
-    print("\n--- Test Complete: PERFORMANCE SUMMARY ---")
-    for metric_name, value in final_metrics.items():
-        print(f"{metric_name:<25}: {value}")
+        print("\nWarning: No Pairs Survivied the 5-Stage Gauntlet.")
+        fall_back_1, fall_back_2 = log_data.columns[0], log_data.columns[1]
+        print(f"Forcing baseline fallback test on {fall_back_1} vs {fall_back_2}...")
+        asset_1, asset_2 = fall_back_1, fall_back_2
+        dynamic_window = 30 # Dafault if forced
 
+
+    # 4. Signal Generation & Portfolio Allocation
+    print("n\Running Modules 2 & 3: Signal Generation & Capital Allocation...")
+    execution_output, final_beta = generate_allocated_execution_states(
+        data[asset_1], data[asset_2], log_data[asset_1], log_data[asset_2], window=dynamic_window
+    )
+    print(f"Calculated Hedge Ratio (Beta): {final_beta:.4f}")
+
+    # 5. Risk & Performance Backtest
+    print("n\Running Module 4: Risk & Performance Evaluation...")
+    perf_df, final_metrics = evaluate_performance(data[asset_1], data[asset_2], execution_output)
+
+    # 6. Output Summary
+    print("\n" + "="*40)
+    print("    Test Complete: PERFORMANCE sUMMARY    ")
+    print("="*40)
+    for metrics_name, value in final_metrics.items():
+        print(f"{metrics_name:<25}: {value}")
+    print("="*40)
 
 
 
