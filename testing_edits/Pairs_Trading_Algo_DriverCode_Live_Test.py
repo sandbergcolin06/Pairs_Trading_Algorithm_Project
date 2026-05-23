@@ -68,7 +68,61 @@ def calculate_half_life(spread):
 def pair_filter(S1_log, S2_log, max_half_life=60):
 	# Runs 5 Stage Testing gauntlet using short-circuit valuation for computational efficiency
 
-	
+	# Stage 1: Engle-Granger Filter
+	eg_result = coint(S1_log, S2_log, autolag='AIC')
+	eg_pvalue = eg_result[1]
+
+	if eg_pvalue >= .05:
+		return False, {} #Short-Circuit: Fail fast
+
+	# Stage 2: Johansen Test (Confirmation)
+
+	pair_df = pd.concat([S1_log, S2_log], axis=1)
+	try:
+		jres = coint_johansen(pair_df, det_order=0, k_ar_diff=1)
+		trace_stat = jres.lr1[0]
+		crit_value_95 = jres.cvt[0, 1] # 1 corresponds to 95% confidence boundry
+
+		if trace_stat <= crit_value_95
+			return False, {} # Short-Circuit: Failed
+	except Exception:
+		return false, {}
+
+	S2_with_const = sm.add_constant(S2_log)
+	ols_model = sm.OLS(S1_log, S2_with_const).fit()
+	beta = ols_model.params.iloc[1]
+	spread = S1_log - (beta * S2_log)
+
+	# Stage 3: Hurst Exponent (The memory Check)
+	hurst_val = calculate_hurst_exponent(spread.values)
+	if hurst_val >= 0.50:
+		return False, {} # Short-Circuit: Spread is random or trending
+
+	# Stage 4: KPSS Test (Confirmatory Stationarity)
+
+	try:
+		_, kpss_pvalue, _, _ = kpss(spread, regression='c', nlags="auto")
+		if kpss_pvalue < 0.05:
+			return False, {} # Short-Circuit: We reject stationarity
+	except Exception:
+		return False, {}
+
+	# Stage 5: Half-Life Filter (Capital Velocity Check)
+
+	half_life = calculate_half_life(spread)
+	if np.isinf(half_life) or half_life <= 1 or half_life > max_half_life:
+		return False, {} # Short-Circuit: Reversion takes too long; capital will be trapped
+
+	# --- All Checks Passed ---
+	metadata = {
+		'Beta': beta,
+		'EG_PValue': eg_pvalue,
+		'Johansen_Trace': trace_stat,
+		'Hurst': hurst_val,
+		'KPSS_PValue': kpss_pvalue,
+		'Half_Life_Days': half_life
+	}
+	return True, metadata
 
 
 # Step 2:
@@ -295,11 +349,14 @@ if __name__ == "__main__":
     print("--- STARTING PIPELINE SMOKE TEST ---")
 
     # 1. Fetching data
-    tickers = ['XOM', 'CVX']
+    tickers = ['XOM', 'CVX', 'COP', 'EOG','PXD']
     print(f"Downloading historical data for: {tickers}")
     raw_data = yf.download(tickers, start='2020-01-01', end='2025-01-01', threads=False)['Close']
     data = raw_data.dropna()
     log_data = np.log(data)
+
+
+
     print("Running Module 1: Cointegration Scan...")
     _,_, identified_pairs = find_cointegrated_pairs(log_data)
     print(f"Pairs flagged as cointegrated: {identified_pairs}")
