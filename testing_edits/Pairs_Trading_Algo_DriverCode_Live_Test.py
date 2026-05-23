@@ -2,7 +2,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-from statsmodels.tsa.stattools import coint
+from statsmodels.tsa.stattools import coint, kpss
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 # Step 1:
 
@@ -24,6 +25,51 @@ def find_cointegrated_pairs(data):
             if pvalue < 0.05:
                 pairs.append((keys[i], keys[j])) 
     return score_matrix, pvalue_matrix, pairs 
+
+def calculate_hurst_exponent(time_series, max_lags=20):
+
+	"""
+	Calculates the Hurst Exponent (H) to evaluate statistical memory
+	H < .05: Mean-reverting series
+	H = .05: Ranom Walk
+	H > .05: Trending Series
+    	"""
+	lags = range(2, max_lags)
+	tau = [np.sqrt(np.std(np.subtract(time_series[lag:], time_series[:-lag))) for lag in lags]
+	poly = np.polyfit(np.log(lags), np.log(tau), 1)
+	return poly[0] * 2.0
+
+def calculate_half_life(spread):
+	"""
+	Calculates the Half-Life (tau) of mean reversion using Ornstien-Uhlenbeck process.
+	Returns the exact number of trading days it takes for a spread to revert halfway
+	"""
+	spread_lag = spread.shift(1)
+	spread_diff = spread.diff()
+
+	# Drop NaNs created by shifting
+	valid_idx = spread_lag.notna() & spread_diff.notna()
+	if not valid_idx.any():
+		return np.nan
+
+	X = sm.add_constant(spread_lag[valid_idx])
+	y = spread_diff[valid_idx]
+
+	model = sm.OLS(y, X).fit()
+	lambda_param = model.params.iloc[1]
+
+	# If lambda is positive, the series is diverging (not mean-reverting)
+	if lambda_param >= 0:
+		return np.inf
+
+	half_life = -np.log(2) / lambda_param
+	return half_life
+
+def pair_filter(S1_log, S2_log, max_half_life=60):
+	# Runs 5 Stage Testing gauntlet using short-circuit valuation for computational efficiency
+
+	
+
 
 # Step 2:
 
