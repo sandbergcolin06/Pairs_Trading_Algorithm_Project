@@ -1,10 +1,20 @@
 import warnings
-import yfinance as yf
+import time
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint, kpss
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
+
+from datetime import datetime
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+start_time = time.perf_counter()
+
+API_Key = "api-key-here"
+Secret_Key = "secret-key-here"
 
 warnings.filterwarnings('ignore')
 
@@ -286,7 +296,7 @@ def generate_allocated_execution_states(S1_raw, S2_raw, S1_log, S2_log,
 if __name__ == "__main__":
     print("--- STARTING PIPELINE of TESTS ---")
 
-    # 1. Fetching data
+    # 1. Fetching data from CSV
     print("Loading tickers from CSV...")
     try:
         tickers_df = pd.read_csv("tickers.csv")
@@ -296,29 +306,49 @@ if __name__ == "__main__":
 
     print(f"Successfully loaded {len(tickers)} tickers from CSV.")
 
-    print("Downloading historical data... (This may take a moment for 1000+ tickers)")
+    # 2. Scraping Historical Data from Alpaca for testing
 
-    raw_data = yf.download(tickers, start='2020-01-01', end='2025-01-01', threads=True)['Close']
-    
-    if isinstance(raw_data.columns, pd.MultiIndex):
-        raw_data = raw_data['Close']
-    
-    print(f"Initial raw data shape: {raw_data.shape}")
+    print(f"Downloading historical data from Alpaca_API for {len(tickers)} tickers...")
+
+    data_client = StockHistoricalDataClient(API_Key, Secret_Key)
+
+    # Pull times for testing
+    start_dt = datetime(2022, 12, 31)
+    end_dt = datetime.now()
+
+    # Fetch the batched data from Alpaca
+    request_params = StockBarsRequest(
+         symbol_or_symbols = tickers,
+         timeframe=TimeFrame.Day,
+         start=start_dt,
+         end=end_dt
+    )
+
+    bars = data_client.get_stock_bars(request_params)
+    alpaca_df = bars.df.reset_index()
+
+    # Putting the alpaca data into raw_data
+    raw_data = alpaca_df.pivot(index='timestamp', columns='symbol', values='close')
+
+    print("Successfully pulled alpaca data.")
 
     if raw_data.empty:
         raise ValueError("No data retrieved from Yahoo Finance.")
     
+    # Cleaning the data 
+
     raw_data = raw_data.dropna(axis=1, how='all')
 
     data = raw_data.ffill().bfill()
 
     data = data.dropna(axis=0, how='any')
 
-    print(f"Cleaned data shape: {data.shape}")
-
     if data.empty:
         raise ValueError("Data is empty after cleaning. Check ticker symbols and date range.")
     
+    print("Data cleaning complete.")
+
+    # turns data into log prices for math engine
     log_data = np.log(data)
 
     # 2. Run 5-Stage Filter
@@ -365,13 +395,19 @@ if __name__ == "__main__":
 
             # 5. Risk & Performance Backtest
             perf_df, final_metrics = evaluate_performance(data[asset_1], data[asset_2], execution_output)
+            days_run = (data.index[-1] -data.index[0]).days
+            years_run = days_run / 365.25
 
+            total_ret_decimal = float(str(final_metrics['Total Return (%)']).strip('%')) / 100
+
+            annualized_return_pct = (((1 + total_ret_decimal) ** (1 / years_run)) - 1) * 100
             # Package the results for this specific pair
             summary_data = {
                 'Pair': f"{asset_1} / {asset_2}",
                 'Half-Life': round(pair_metrics['Half_Life_Days'], 2),
                 'Beta': round(final_beta, 4),
                 'Total Return (%)': round(float(str(final_metrics['Total Return (%)']).strip('%')), 2),
+                'Annualized Return (%)': np.round(annualized_return_pct, 2),
                 'Sharpe Ratio': round(float(final_metrics['Annualized Sharp Ratio']), 2),
                 'Max Drawdown (%)': round(float(str(final_metrics['Max Drawdown (%)']).strip('%')), 2)
             }
@@ -381,21 +417,52 @@ if __name__ == "__main__":
         print("\n" + "="*70)
         print("          BULK TEST COMPLETE: MASTER SCOREBOARD          ")
         print("="*70)
+
         
         # Convert to a DataFrame for easy reading and sorting
         results_df = pd.DataFrame(master_scoreboard)
         
-        # Sort by best Sharpe Ratio
-        results_df = results_df.sort_values(by='Sharpe Ratio', ascending=False).reset_index(drop=True)
+        # --- The Elite Pair Filter ---
+        # Keep only pairs With Sharpe >= 1.5, Half-Life 5-30, and Annualized Return >= 5%
+        filtered_df = results_df[
+             (results_df['Sharpe Ratio'] >= 1.5) &
+             (results_df['Half-Life'] >= 5) &
+             (results_df['Half-Life'] <= 30) &
+             (results_df['Annualized Return (%)'] >= 5.0)
+        ]
+
+        # Sort the surviving pairs by best Sharpe Ratio
+        filtered_df = filtered_df.sort_values(by='Sharpe Ratio', ascending=False).reset_index(drop=True)
+
+        # Check if any pairs actually survived the gauntlet
+        if filtered_df.empty:
+             print("Zero pairs met criteria (Sharpe >= 1.5, Half-Life 5-30, and Annualized Return >= 5%")
+             print("Try testing different sector or relaxing constraints")
+        else:
+             print(f"Success! Found {len(filtered_df)} elite pairs that passed all filters:\n")
+             print(filtered_df.to_string(index=False))
+
+             # Save Elite Pairs to CSV
+             filtered_df.to_csv("backtest_results.csv", index=False)
+             print("\nElite pairs successfully saved to 'pairs_backtest_results.csv'")
         
-        print(results_df.to_string(index=False))
+        # end
         print("="*70)
-        
-        # Save to CSV for your records
-        results_df.to_csv("pairs_backtest_results.csv", index=False)
 
     else:
         print("\nWarning: No Pairs Survived the 5-Stage Gauntlet. Adjust your ticker list.")
+    
+
+    end_time = time.perf_counter()
+
+    run_time = end_time - start_time
+
+    minutes, seconds = divmod(run_time, 60)
+    print(f"Algo_Run_Time: {int(minutes)}m {seconds: .2f}")
+
+
+    
+    
     
 
 
